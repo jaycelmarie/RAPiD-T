@@ -38,7 +38,7 @@ class Detector():
             'Total number of trainable parameters:', total_params)
         
         # Name changes for backwards compatibility
-        weights_dict = torch.load(weights_path)
+        weights_dict = torch.load(weights_path, map_location='cpu')
         assert 'model_state_dict' in weights_dict or 'model' in weights_dict
         if 'model_state_dict' in weights_dict:
             model_dict = weights_dict['model_state_dict']
@@ -91,6 +91,21 @@ class Detector():
             plt.imshow(np_img)
             plt.show()
         return detections
+        
+    def detect_imgSeq(self, img_dir, **kwargs):
+        '''
+        Run on a sequence of images in a folder.
+
+        Args:
+            img_dir: str
+            input_size: int, input resolution
+            conf_thres: float, confidence threshold
+        '''
+        gt_path = kwargs['gt_path'] if 'gt_path' in kwargs else None
+
+        ims = dataloader.Images4Detector(img_dir, gt_path) # TODO
+        dts = self._detect_iter(iter(ims), **kwargs)
+        return dts
 
     def _detect_iter(self, iterator, **kwargs):
         detection_json = []
@@ -131,51 +146,6 @@ class Detector():
         input_ = input_.to(device=device)
         with torch.no_grad():
             dts = self.model(input_).cpu()
-
-        dts = dts.squeeze()
-        # post-processing
-        dts = dts[dts[:,5] >= conf_thres]
-        if len(dts) > 1000:
-            _, idx = torch.topk(dts[:,5], k=1000)
-            dts = dts[idx, :]
-        if kwargs.get('debug', False):
-            np_img = np.array(input_img)
-            visualization.draw_dt_on_np(np_img, dts)
-            plt.imshow(np_img)
-            plt.show()
-        dts = utils.nms(dts, is_degree=True, nms_thres=0.45, img_size=input_size)
-        dts = utils.detection2original(dts, pad_info.squeeze())
-        if kwargs.get('debug', False):
-            np_img = np.array(pil_img)
-            visualization.draw_dt_on_np(np_img, dts)
-            plt.imshow(np_img)
-            plt.show()
-        return dts
-
-    def predict_pil_feats(self, pil_img, **kwargs):
-        input_size = kwargs.get('input_size', self.input_size)
-        assert isinstance(pil_img, Image.Image), 'input must be a PIL.Image'
-        assert input_size is not None, 'Please specify the input resolution'
-
-        # pad to square
-        input_img, _, pad_info = utils.rect_to_square(pil_img, None, input_size, 0)
-
-        input_ori = tvf.to_tensor(input_img)
-        input_ = input_ori.unsqueeze(0)
-
-        assert input_.dim() == 4
-        input_ = input_.cuda()
-        with torch.no_grad():
-            small, medium, large, img_size = self.model(input_, only_feat=True)
-        return small, medium, large, pad_info, img_size
-
-    def predict_pil_dets(self, small, medium, large, pad_info, **kwargs):
-        input_size = kwargs.get('input_size', self.input_size)
-        conf_thres = kwargs.get('conf_thres', self.conf_thres)
-        assert conf_thres is not None, 'Please specify the confidence threshold'
-
-        with torch.no_grad():
-            dts = self.model([small, medium, large], only_det=True, img_size=input_size).cpu()
 
         dts = dts.squeeze()
         # post-processing
