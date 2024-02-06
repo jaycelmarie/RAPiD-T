@@ -7,8 +7,6 @@ import torchvision.transforms.functional as tvf
 from utils.iou_mask import iou_mask, iou_rle
 import models.backbones
 import models.losses
-from models.embedding import featEmbedding
-
 
 
 class RAPiD(nn.Module):
@@ -28,10 +26,14 @@ class RAPiD(nn.Module):
 
         if backbone == 'dark53':
             self.backbone = models.backbones.Darknet53()
+            print("Using backbone Darknet-53. Loading ImageNet weights....")
             backbone_imgnet_path = './weights/dark53_imgnet.pth'
             if os.path.exists(backbone_imgnet_path):
                 pretrained = torch.load(backbone_imgnet_path)
                 self.load_state_dict(pretrained)
+            else:
+                print('Warning: no ImageNet-pretrained weights found.',
+                      'Please check https://github.com/duanzhiihao/RAPiD for it.')
         elif backbone == 'res34':
             self.backbone = models.backbones.resnet34()
         elif backbone == 'res50':
@@ -57,46 +59,26 @@ class RAPiD(nn.Module):
         self.pred_M = PredLayer(self.anchors_all, self.index_M, **kwargs)
         self.pred_S = PredLayer(self.anchors_all, self.index_S, **kwargs)
 
-        self.feat_embedding_small = featEmbedding(256, 2048)
-        self.feat_embedding_medium = featEmbedding(512, 2048)
-        self.feat_embedding_large = featEmbedding(1024, 2048)
-    def forward(self, x, labels=None, only_feat=False, only_det=False, embedding_out=None, img_size=None, **kwargs):
+    def forward(self, x, labels=None, **kwargs):
         '''
         x: a batch of images, e.g. shape(8,3,608,608)
         labels: a batch of ground truth
         '''
-        assert int(embedding_out != None) + int(only_feat) + int(only_det) <= 1
+        assert x.dim() == 4
+        self.img_size = x.shape[2:4]
 
-        if embedding_out == 'small':
-            return self.feat_embedding_small(x)
-        elif embedding_out == 'medium':
-            return self.feat_embedding_medium(x)
-        elif embedding_out == 'large':
-            return self.feat_embedding_large(x)
+        # go through backbone
+        small, medium, large = self.backbone(x)
 
-        if only_det:
-            assert len(x) == 3
-            small, medium, large = x
-        else:
-            # torch.cuda.reset_max_memory_allocated()
-            torch.cuda.reset_max_memory_allocated()
-            assert x.dim() == 4
-            img_size = x.shape[2]
-
-            # go through backbone
-            small, medium, large = self.backbone(x)
-
-            if only_feat:
-                return small, medium, large, torch.tensor([img_size]).cuda()
         # go through detection blocks in three scales
         detect_L, feature_L = self.branch_L(large, previous=None)
         detect_M, feature_M = self.branch_M(medium, previous=feature_L)
         detect_S, _ = self.branch_S(small, previous=feature_M)
 
         # process the boxes, and calculate loss if there is gt
-        boxes_L, loss_L = self.pred_L(detect_L, img_size, labels)
-        boxes_M, loss_M = self.pred_M(detect_M, img_size, labels)
-        boxes_S, loss_S = self.pred_S(detect_S, img_size, labels)
+        boxes_L, loss_L = self.pred_L(detect_L, self.img_size, labels)
+        boxes_M, loss_M = self.pred_M(detect_M, self.img_size, labels)
+        boxes_S, loss_S = self.pred_S(detect_S, self.img_size, labels)
 
         if labels is None:
             # assert boxes_L.dim() == 3
@@ -205,14 +187,14 @@ class PredLayer(nn.Module):
 
         if labels is None:
             # inference, convert final predictions to image space
-            pred_final[..., 0] *= img_hw
-            pred_final[..., 1] *= img_hw
+            pred_final[..., 0] *= img_hw[1]
+            pred_final[..., 1] *= img_hw[0]
             # self.dt_cache = pred_final.clone()
             return pred_final.view(nB, -1, nCH).detach(), None
         else:
             # training, convert final predictions to be normalized
-            pred_final[..., 2] /= img_hw
-            pred_final[..., 3] /= img_hw
+            pred_final[..., 2] /= img_hw[1]
+            pred_final[..., 3] /= img_hw[0]
             # force the normalized w and h to be <= 1
             pred_final[..., 0:4].clamp_(min=0, max=1)
 
@@ -235,6 +217,9 @@ class PredLayer(nn.Module):
 
         ti_all = tx_all.long()
         tj_all = ty_all.long()
+
+        # workaround to be compatible with newer version pytorch. See issue #35. 
+        img_hw = torch.Tensor(list(img_hw)).to(device=device)
 
         norm_anch_wh = anchors[:,0:2] / img_hw # normalized
         norm_anch_00wha = self.anch_00wha_all.clone().to(device=device)
@@ -286,7 +271,7 @@ class PredLayer(nn.Module):
                 # pred_ious = iou_mask(selected.view(-1,5), gt_boxes, xywha=True,
                 #                     mask_size=32, is_degree=True)
                 pred_ious = iou_rle(selected.view(-1,5), gt_boxes, xywha=True,
-                                    is_degree=True, img_size=img_hw, normalized=True)
+                                    is_degree=True, img_size=tuple(img_hw.tolist()), normalized=True)
                 pred_best_iou, _ = pred_ious.max(dim=1)
                 to_be_ignored = (pred_best_iou > self.ignore_thre)
                 # set mask to zero (ignore) if the pred BB has a large IoU with any gt BB
